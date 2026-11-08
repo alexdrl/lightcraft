@@ -115,12 +115,17 @@ const LOCAL_STEP: RangeInclusive<f64> = 0.02..=0.5;
 const FLAT_SLOPE: f64 = 0.5;
 
 /// A flat segment ([`FLAT_SLOPE`]) is checked against the camera JPEG's local slope there (between neighbouring proxy
-/// pixels). Over this multiple of the curve's slope, the JPEG keeps texture the curve flattens; under
-/// [`AGAINST_SCENE`], the JPEG gets darker where the scene gets brighter. Either way the curve learned a local or
-/// spatial operator of the camera (DRO, shading), not its tone curve.
+/// pixels). Over this multiple of the curve's slope, the JPEG keeps texture the curve flattens; under both
+/// [`AGAINST_SCENE`] and the curve's own slope, the JPEG brightens less than the curve where the scene gets brighter,
+/// or gets darker. Either way the curve learned a local or spatial operator of the camera (DRO, shading), not its tone
+/// curve.
 const KEPT_TEXTURE: f64 = 2.5;
 
-/// See [`KEPT_TEXTURE`].
+/// See [`KEPT_TEXTURE`]. Capped by the curve's own slope, so a segment whose JPEG agrees with a curve this flat (a
+/// strong highlight shoulder) does not count. On the burst behind [`MAX_FLATTENED_SEGMENTS`], the two refused corpus
+/// files (Canon PowerShot G3 X, Samsung NX20) and the synthetic sheet test, every segment counted here has a JPEG
+/// slope below the curve's (JPEG 0.25 at most, curve 0.2–0.48), so the cap changes no count; counting only a falling
+/// JPEG (under 0) would drop the NX20 from 3 to 0 and the synthetic sheet from 5 to 1.
 const AGAINST_SCENE: f64 = 0.25;
 
 /// Fewest neighbouring pairs a segment needs before its local slope counts.
@@ -156,14 +161,16 @@ pub(super) fn flattened_segments(tone: &CameraTone, sensor: &Rgb32f, reference: 
         let scene = luma(colour(x.map(f64::from)).map(|v| v.max(0.0)));
         ((0.0003..0.85).contains(&jpeg) && scene.is_finite() && scene > 0.0).then_some((scene, jpeg))
     };
+    // once per pixel: each one is a centre and the right or below neighbour of up to two others
+    let levels: Vec<Option<(f64, f64)>> = (0..sensor.data.len().min(w * h)).map(level).collect();
     // per segment: Σ du·dv, Σ du², neighbouring pairs
     let mut sums = [(0.0, 0.0, 0usize); 31];
-    for i in 0..sensor.data.len().min(w * h) {
-        let Some((s0, j0)) = level(i) else { continue };
+    for (i, here) in levels.iter().enumerate() {
+        let Some((s0, j0)) = *here else { continue };
         let right = (i % w + 1 < w).then_some(i + 1);
         let below = (i / w + 1 < h).then_some(i + w);
         for j in [right, below].into_iter().flatten() {
-            let Some((s1, j1)) = level(j) else { continue };
+            let Some(&Some((s1, j1))) = levels.get(j) else { continue };
             let du = (s1 / s0).ln();
             if !LOCAL_STEP.contains(&du.abs()) {
                 continue;
@@ -188,7 +195,7 @@ pub(super) fn flattened_segments(tone: &CameraTone, sensor: &Rgb32f, reference: 
         }
         let curve = ((f64::from(b[1]) + ELASTICITY_BLACK) / (f64::from(a[1]) + ELASTICITY_BLACK)).ln() / run;
         let local = cross / square;
-        if curve < FLAT_SLOPE && (local < AGAINST_SCENE || local > KEPT_TEXTURE * curve) {
+        if curve < FLAT_SLOPE && (local < AGAINST_SCENE.min(curve) || local > KEPT_TEXTURE * curve) {
             flattened += 1;
         }
     }
@@ -336,6 +343,7 @@ pub(super) fn limit_elasticity(mut knots: [[f32; 2]; 32], pairs: &[(f64, f64)]) 
     None
 }
 
+/// The upper median of `values` (sorted in place), `None` when empty.
 fn median(values: &mut [f64]) -> Option<f64> {
     values.sort_by(f64::total_cmp);
     values.get(values.len() / 2).copied()
